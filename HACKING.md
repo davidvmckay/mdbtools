@@ -91,17 +91,36 @@ encryption keys, and name of the creating program.  Note, this page is
 "encrypted" with a simple rc4 key starting at offset 0x18 and extending for
 126 (Jet3) or 128 (Jet4) bytes.
 
-Offset 0x14 contains the Jet version of this database:
+The 15 bytes at offset 0x04 name the engine which wrote the file, "Standard
+Jet DB" for Jet 3 and Jet 4, "Standard ACE DB" for Access 2007 and later, and
+"MSISAM Database" for the Money file variant, which uses its own encryption.
 
-- 0x00 for 3
-- 0x01 for 4
-- 0x02 for 5
-- 0x03 for Access 2010
-- 0x04 for Access 2013
-- 0x05 for Access 2016
-- 0x06 for Access 2019
+Offset 0x14 begins a 4 byte file format version.  The first byte is the format
+code:
 
-This is used by the `mdb-ver` utility to determine the Jet version.
+- 0x00 for Jet 3, which Access 97 writes
+- 0x01 for Jet 4, which Access 2000 through 2003 write
+- 0x02 for the format Access 2007 writes
+- 0x03 for the format Access 2010 writes
+- 0x04 for Access 2013, which wrote what Access 2010 wrote, so no file has
+  been seen carrying this code
+- 0x05 for the format Access 2016 writes
+- 0x06 for the format Access 2019 writes.  Access 2019 and Access 2021 both
+  report themselves as Access version 16, so there is no Access 17
+
+The first byte is what the `mdb-ver` utility reads.  The second byte, at 0x15,
+is a sub-version, and ms access tests it only for codes 3 and 4.  Together the
+two are a forward compatibility gate with two levels, raised by what the
+database holds and never lowered:
+
+- `02 00` a database with nothing past Access 2007 in it
+- `03 00` one which gained an Access 2010 feature that Access 2007 SP2 opens
+  with that object read only, such as a calculated column
+- `03 01` one which gained a feature Access 2007 SP2 must refuse, such as one
+  of the Access 2010 sort orders, Access 2010 encryption, or publication to
+  Access Services
+
+The other two bytes have been seen only as zero.
 
 The 20 bytes (Jet3) or 40 bytes (Jet4) starting at 0x42 are the database
 password.  In Jet4, there is an additional mask applied to this password
@@ -128,7 +147,7 @@ The header of a Jet3 data page looks like this:
 | data | length  | name       | description                                |
 +------+---------+---------------------------------------------------------+
 | 0x01 | 1 byte  | page_type  | 0x01 indicates a data page.                |
-| 0x01 | 1 byte  | unknown    |                                            |
+| 0x01 | 1 byte  | constant 1 | 1 on every page type                       |
 | ???? | 2 bytes | free_space | Free space in this page                    |
 | ???? | 4 bytes | tdef_pg    | Page pointer to table definition           |
 | ???? | 2 bytes | num_rows   | number of records on this page             |
@@ -141,13 +160,23 @@ The header of a Jet3 data page looks like this:
 
 Notes:
 
-- In Jet4, an additional four-byte field was added after tdef_pg.  Its purpose
-  is currently unknown.
+- In Jet4, an additional four-byte field was added after tdef_pg.  It is a
+  write time stamp, the GetTickCount() value when the page was written, which
+  is the machine uptime in milliseconds.  The ms access page initializer sets
+  it to zero and the write path fills it in, so most pages carry zero.  No
+  reader of it is known.
 - Offsets that have 0x40 in the high order byte point to a location within the
   page where a Data Pointer (4 bytes) to another data page (also known as an
-  overflow page) is stored.  Called 'lookupflag' in source code.
+  overflow page) is stored.  Called 'lookupflag' in source code.  The Data
+  Pointer has the same layout as the LVAL pointers described below (row number
+  in the low byte, page number in the upper three bytes).  The relocated row on
+  the overflow page has the 0x80 flag set, so it is only reached through the
+  pointer and is not read again when the overflow page is scanned.
 - Offsets that have 0x80 in the high order byte are deleted rows.  Called
-  'delflag' in source code.
+  'delflag' in source code.  A row can be both deleted and an overflow
+  pointer.
+- The offset itself is the low 13 bits of the field, mask 0x1FFF.  The
+  remaining bit, 0x2000, has not been seen set on any row offset examined.
 
 
 Rows are stored from the end of the page to the top of the page.  So, the first
@@ -242,7 +271,10 @@ Each memo column (or other long binary data) in a row
 | ???? | 3 bytes | memo_len    | Total length of the memo                 |
 | ???? | 1 bytes | bitmask     | See values                               |
 | ???? | 4 bytes | lval_dp     | Data pointer to LVAL page (if needed)    |
-| 0x00 | 4 bytes | unknown     |                                          |
+| 0x00 | 4 bytes | stamp       | The same write time stamp as the one in  |
+|      |         |             | the data page header.  Both this and     |
+|      |         |             | lval_dp are zero when the value is       |
+|      |         |             | inline (bitmask 0x80)                    |
 +------+---------+-------------+------------------------------------------+
 ```
 
@@ -255,7 +287,7 @@ Values for the bitmask:
 If the memo is in a LVAL page, we use row_id of lval_dp to find the row.
 
 ```c
-offset_start of memo = (int16*) LVAL_page[offset_num_rows + (row_id * 2) + 2]
+offset_start of memo = (int16*) LVAL_page[offset_num_rows + (row_id * 2) + 2] & offset_mask
 if (row_id = 0)
      offset_stop of memo = 2048(jet3) or 4096(jet4)
 else
@@ -265,13 +297,10 @@ else
 The length (partial if type 2) for the memo is:
 memo_page_len = offset_stop - offset_start
 
-Update: The bitmask can't be an entire byte long.
-OLE fields can hold up to 1gig. That requires at least 30 bits, leaving only 2
-bits for flags. Maybe sometimes 0xC0000000 is ignored?
-See http://office.microsoft.com/en-us/access-help/access-2007-specifications-HA010030739.aspx
-Number of characters in a Memo field: 65,535 when entering data through the
-user interface; 2 gigabytes of character storage when entering data
-programmatically. That would mean 31 bits for length.
+The bitmask is not a whole byte.  memo_len and the bitmask are one 32 bit
+little endian field: the top two bits, mask 0xC0000000, hold the type, and the
+low 30 bits hold the length.  That is why the maximum length of an OLE or memo
+value is 0x3FFFFFFF, which is the 1 gigabyte the Access specifications give.
 
 Note: if a memo field is marked for compression, only at value which is at
 most 1024 characters when uncompressed can be compressed.  fields longer than
@@ -282,7 +311,8 @@ LVAL (Long Value) Pages
 -----------------------
 
 The header of a LVAL page is just like that of a regular data page,
-except that in place of the tdef_pg is the word 'LVAL'.
+except that in place of the tdef_pg is the word 'LVAL'.  The four bytes after
+it are the same write time stamp as on a data page.
 
 Each memo record type 1 looks like this:
 
@@ -349,7 +379,10 @@ next_pg field.
 |      |         |             | autonumber column, if any. 0 otherwise   |
 | 0x4e | 1 byte  | table_type  | 0x4e: user table, 0x53: system table     |
 | ???? | 2 bytes | max_cols    | Max columns a row will have (deletions)  |
-| ???? | 2 bytes | num_var_cols| Number of variable columns in table      |
+| ???? | 2 bytes | num_var_cols| Number of variable column slots.  A      |
+|      |         |             | deleted column keeps its slot, as with   |
+|      |         |             | max_cols, so this can be more than the   |
+|      |         |             | variable columns the table now has       |
 | ???? | 2 bytes | num_cols    | Number of columns in table (repeat)      |
 | ???? | 4 bytes | num_idx     | Number of logical indexes in table       |
 | ???? | 4 bytes | num_real_idx| Number of index entries                  |
@@ -360,19 +393,23 @@ next_pg field.
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_real_idx (8 bytes per idxs)               |
 +-------------------------------------------------------------------------+
-| 0x00 | 4 bytes | ???         |                                          |
-| ???? | 4 bytes | num_idx_rows| (not sure)                               |
+| ???? | 4 bytes | idx_rows1   | A row count statistic, kept loosely      |
+| ???? | 4 bytes | idx_rows2   | A second row count statistic             |
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_cols (18 bytes per column)                |
 +-------------------------------------------------------------------------+
 | ???? | 1 byte  | col_type    | Column Type (see table below)            |
 | ???? | 2 bytes | col_num     | Column Number (includes deleted columns) |
 | ???? | 2 bytes | offset_V    | Offset for variable length columns       |
-| ???? | 2 bytes | col_num     | Column Number                            |
+| ???? | 2 bytes | col_id      | Id given to the column when it was       |
+|      |         |             | created.  Access never renumbers it      |
+| ???? | 2 bytes | ???         | seen only as 0 or 1, and the same value  |
+|      |         |             | on every column of a file, so it seems   |
+|      |         |             | to record something about the file       |
+|      |         |             | rather than the column                   |
 | ???? | 2 bytes | sort_order  | textual column sort order(0x409=General) |
 | ???? | 2 bytes | misc        | prec/scale (1 byte each), or code page   |
 |      |         |             | for textual columns (0x4E4=cp1252)       |
-| ???? | 2 bytes | ???         |                                          |
 | ???? | 1 byte  | bitmask     | See Column flags bellow                  |
 | ???? | 2 bytes | offset_F    | Offset for fixed length columns          |
 | ???? | 2 bytes | col_len     | Length of the column (0 if memo)         |
@@ -404,7 +441,8 @@ next_pg field.
 |      |         |             | (or -1 if this index is not a fk)        |
 | 0x00 | 4 bytes | rel_tbl_page| page number of other table in fk         |
 | 0x01 | 1 byte  | cascade_ups | flag indicating if updates are cascaded  |
-| 0x01 | 1 byte  | cascade_dels| flag indicating if deletes are cascaded  |
+| 0x01 | 1 byte  | cascade_dels| 0x01 cascades deletes, 0x02 sets the     |
+|      |         |             | foreign key to null on delete            |
 | ???? | 1 byte  | index_type  | 0x01 if index is primary, 0x02 if foreign|
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_idx                                       |
@@ -427,18 +465,23 @@ next_pg field.
 | data | length  | name        | description                              |
 +------+---------+-------------+------------------------------------------+
 | ???? | 4 bytes | tdef_len    | Length of the data for this page         |
-| ???? | 4 bytes | unknown     | unknown                                  |
+| 1625 | 4 bytes | tag         | A structure tag, repeated at the head of |
+|      |         |             | each column block and each logical index |
+|      |         |             | block.  Index column blocks use 1923     |
 | ???? | 4 bytes | num_rows    | Number of records in this table          |
 | 0x00 | 4 bytes | autonumber  | value for the next value of the          |
 |      |         |             | autonumber column, if any. 0 otherwise   |
-| 0x01 | 1 byte  | autonum_flag| 0x01 makes autonumbers work in access    |
-| ???? | 3 bytes | unknown     | unknown                                  |
+| 0x01 | 1 byte  | autonum_flag| 0x01 enables autonumbering               |
+| 0x00 | 3 bytes | unknown     | zero in every definition seen            |
 | 0x00 | 4 bytes | ct_autonum  | autonumber value for complex type column(s) |
 |      |         |             | (shared across all columns in the table) |
-| ???? | 8 bytes | unknown     | unknown                                  |
+| ???? | 8 bytes | unknown     | uninitialized page residue, not a field  |
 | 0x4e | 1 byte  | table_type  | 0x4e: user table, 0x53: system table     |
 | ???? | 2 bytes | max_cols    | Max columns a row will have (deletions)  |
-| ???? | 2 bytes | num_var_cols| Number of variable columns in table      |
+| ???? | 2 bytes | num_var_cols| Number of variable column slots.  A      |
+|      |         |             | deleted column keeps its slot, as with   |
+|      |         |             | max_cols, so this can be more than the   |
+|      |         |             | variable columns the table now has       |
 | ???? | 2 bytes | num_cols    | Number of columns in table (repeat)      |
 | ???? | 4 bytes | num_idx     | Number of logical indexes in table       |
 | ???? | 4 bytes | num_real_idx| Number of index entries                  |
@@ -449,24 +492,31 @@ next_pg field.
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_real_idx (12 bytes per idxs)              |
 +-------------------------------------------------------------------------+
-| 0x00 | 4 bytes | ???         |                                          |
-| ???? | 4 bytes | num_idx_rows| (not sure)                               |
-| 0x00 | 4 bytes | ???         |                                          |
+| ???? | 4 bytes | idx_rows1   | A row count statistic, kept loosely      |
+| ???? | 4 bytes | idx_rows2   | A second row count statistic             |
+| 0x00 | 4 bytes | ???         | zero in every block seen                 |
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_cols (25 bytes per column)                |
 +-------------------------------------------------------------------------+
 | ???? | 1 byte  | col_type    | Column Type (see table below)            |
-| ???? | 4 bytes | unknown     | matches first unknown definition block   |
+| 1625 | 4 bytes | tag         | the same structure tag as the definition |
 | ???? | 2 bytes | col_num     | Column Number (includes deleted columns) |
 | ???? | 2 bytes | offset_V    | Offset for variable length columns       |
-| ???? | 2 bytes | col_num     | Column Number                            |
+| ???? | 2 bytes | col_id      | Id given to the column when it was       |
+|      |         |             | created.  Access never renumbers it, so  |
+|      |         |             | a table which has had a column deleted   |
+|      |         |             | has gaps here while col_num shifts       |
 | ???? | 2 bytes | misc        | prec/scale (1 byte each), or sort order  |
 |      |         |             | for textual columns(0x409=General)       |
 |      |         |             | or "complexid" for complex columns (4bytes)|
-| ???? | 2 bytes | misc_ext    | text sort order version num is 2nd byte  |
+| ???? | 2 bytes | misc_ext    | the collation variant in the 1st byte,   |
+|      |         |             | the text sort order version in the 2nd.  |
+|      |         |             | together with the sort order above these |
+|      |         |             | make the ms access 32 bit sort id: lcid, |
+|      |         |             | variant, weight table family             |
 | ???? | 1 byte  | bitmask     | See column flags below                   |
-| ???? | 1 byte  | misc_flags  | 0x01 for compressed unicode              |
-| 0000 | 4 bytes | ???         |                                          |
+| ???? | 1 byte  | misc_flags  | See column ext flags below               |
+| 0x00 | 4 bytes | ???         | zero in every column seen                |
 | ???? | 2 bytes | offset_F    | Offset for fixed length columns          |
 | ???? | 2 bytes | col_len     | Length of the column (0 if memo/ole)     |
 +-------------------------------------------------------------------------+
@@ -477,7 +527,8 @@ next_pg field.
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_real_idx (30+22 = 52 bytes)               |
 +-------------------------------------------------------------------------+
-| ???? | 4 bytes | ???         |                                          |
+| 1923 | 4 bytes | tag         | the structure tag of an index column     |
+|      |         |             | block                                    |
 +-------------------------------------------------------------------------+
 | Iterate 10 times for 10 possible columns (10*3 = 30 bytes)              |
 +-------------------------------------------------------------------------+
@@ -486,12 +537,15 @@ next_pg field.
 +-------------------------------------------------------------------------+
 | ???? | 4 bytes | used_pages  | Points to usage bitmap for index         |
 | ???? | 4 bytes | first_dp    | Data pointer of the index page           |
+| ???? | 4 bytes | unknown     | uninitialized page residue               |
 | ???? | 1 byte  | flags       | See flags table for indexes              |
-| ???? | 9 bytes | unknown     |                                          |
+| ???? | 1 byte  | complex_idx | 2 if the index is over a complex column. |
+|      |         |             | 0 on every other index seen              |
+| 0x00 | 4 bytes | unknown     | zero in every block seen                 |
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_idx (28 bytes)                            |
 +-------------------------------------------------------------------------+
-| ???? | 4 bytes | unknown     | matches first unknown definition block   |
+| 1625 | 4 bytes | tag         | the same structure tag as the definition |
 | ???? | 4 bytes | index_num   | Number of the index                      |
 |      |         |             |(warn: not always in the sequential order)|
 | ???? | 4 bytes | index_num2  | Index into index cols list               |
@@ -501,8 +555,10 @@ next_pg field.
 |      |         |             | (or -1 if this index is not a fk)        |
 | 0x00 | 4 bytes | rel_tbl_page| page number of other table in fk         |
 | 0x01 | 1 byte  | cascade_ups | flag indicating if updates are cascaded  |
-| 0x01 | 1 byte  | cascade_dels| flag indicating if deletes are cascaded  |
+| 0x01 | 1 byte  | cascade_dels| 0x01 cascades deletes, 0x02 sets the     |
+|      |         |             | foreign key to null on delete            |
 | ???? | 1 byte  | index_type  | 0x01 if index is primary, 0x02 if foreign|
+| 0x00 | 4 bytes | ???         | zero in every block seen                 |
 +-------------------------------------------------------------------------+
 | Iterate for the number of num_idx                                       |
 +-------------------------------------------------------------------------+
@@ -519,24 +575,64 @@ next_pg field.
 +-------------------------------------------------------------------------+
 ```
 
-Columns flags (not complete):
+Columns flags:
 
 - 0x01: fixed length column
-- 0x02: can be null (possibly related to joins?)
+- 0x02: updatable
 - 0x04: is auto long
-- 0x10: replication related field (or hidden?). These columns start with "s_" or
-      "Gen_" (the "Gen_" fields are for memo fields)
+- 0x10: ms access maintains the column and hides it.  The columns of the
+      system catalog tables, `MSysComplexColumns` included, and the
+      replication columns ("s_" and "Gen_") carry it
+- 0x20: the column holds a windows security identifier.  The only columns seen
+      carrying it are `MSysObjects.Owner` and `MSysACEs.SID`
 - 0x40: is auto guid
 - 0x80: hyperlink. Syntax is "Link Title#http://example.com/somepage.html#" or
       "#PAGE.HTM#"
 
+Bit 0x08 has not been seen set on any column examined.
+
+The Jet4 misc_flags byte, which the Jet3 column block has no room for, holds a
+second set:
+
+- 0x01: the text of the column is stored in the compressed unicode form
+- 0x08: the column is the complex value foreign key of a complex column's flat
+      table.  Access refuses to open a table whose flat table does not carry
+      it
+- 0x10: a value column of an attachment flat table, which are `FileData`,
+      `FileFlags`, `FileName`, `FileType`, `FileTimeStamp` and `FileURL`.
+      Access writes it and does not require it
+- 0x20: a version history complex column.  Access requires it, and without it
+      shows that column in the datasheet as a column of its own
+- 0xC0: the column is calculated.  The expression is the `Expression` property
+      of the column, and each row stores the last computed value inside a 23
+      byte wrapper which gives the length of the value as 4 bytes at offset
+      16, the value itself following.  A calculated column of fixed type
+      declares a length of 39
+
 In Access 2007 and Access 2010, "Complex Columns" (multivalued fields, version
 history, attachments) always have the flag byte set to exactly 0x07.
 
-Index flags (not complete):
+Attachment data is stored with an 8 byte wrapper header, a 4 byte flag telling
+whether the content is deflated and a 4 byte length, then the content.  The
+content begins with its own header:
+
+- 32 bits header length (this includes the length)
+- 32 bits constant 1
+- 32 bits character count of the string which follows
+- the file extension as UCS-2 with a null terminator
+
+Ms access stores `jpg jpeg gif png zip cab docx xlsx xlsb pptx` raw and
+deflates everything else, archives and mp3 files included.
+
+Index flags:
 - 0x01 Unique
 - 0x02 IgnoreNuls
 - 0x08 Required
+- 0x80 set by Access 2000 and later on every index it writes
+
+Bits 0x04, 0x10, 0x20 and 0x40 have not been seen set on any index examined.
+The col_order byte of an index column has been seen only as 0x01 for ascending
+and 0x00 for descending.
 
 Column Type may be one of the following (not complete):
 ```
@@ -552,12 +648,32 @@ Column Type may be one of the following (not complete):
     TEXT            = 0x0A /* Text          (255 bytes) */
     OLE             = 0x0B /* OLE = Long binary */
     MEMO            = 0x0C /* Memo = Long text*/
-    UNKNOWN_0D      = 0x0D
-    UNKNOWN_0E      = 0x0E
     REPID           = 0x0F /* GUID */
     NUMERIC         = 0x10 /* Scaled decimal  (17 bytes) */
+    BIGBINARY       = 0x11 /* Fixed binary, declared length 4000 */
+    COMPLEX         = 0x12 /* Key of a complex column  (32 bits) */
+    BIGINT          = 0x13 /* Long Integer    (64 bits), ace only */
+    EXTDATETIME     = 0x14 /* Date/Time Extended    (42 bytes) */
 
 ```
+
+0x0D and 0x0E are not column types.  The column factory in both the jet and
+the ace engine sends those two codes to its error path, so neither engine can
+create such a column or read one, and no file examined holds one.
+
+BIGBINARY is a fixed length binary column longer than the 255 byte BINARY.
+The only use seen is the `Data` column of `MSysAccessObjects`, which holds the
+forms, reports and vba of the database as a chunked OLE compound file.  It is Jet 4
+only: Jet 3 used BINARY for the same column and the ace engine dropped the
+table, so it cannot appear in an accdb.
+
+BIGINT arrived in Access 2016 at build 16.0.7812, so an earlier ace engine
+rejects it.
+
+EXTDATETIME is the "Date/Time Extended" type of Access 2019, which keeps a
+date from year 1 with 7 digits of fractional seconds.  It is stored as 42
+bytes of ascii: 19 digits of days since 0001-01-01, a colon, 12 digits of
+seconds, 7 digits of 100 nanosecond units, then `:7` and a null byte.
 
 Notes on reading index metadata:
 
@@ -695,6 +811,11 @@ Indices are not completely understood but here is what we know.
 +-------------------------------------------------------------------------+
 ```
 
+The layout above is the Jet3 one.  Jet4 adds a 4 byte write stamp after
+parent_page, the same field a data page carries, and a 1 byte level after
+pref_len.  The level is the depth of the page below the leaves of the index
+tree: 0 on a leaf page and one more than its children on a node page.
+
 Index pages come in two flavors.
 
 0x04 pages are leaf pages which contain one entry for each row in the table.  
@@ -795,6 +916,15 @@ That is, the shared prefix is [7f 00 00 00], so the actual next entry is:
 
 so the key value is 2 (the last octet changes to 02) page 261 row 4.
 
+An index entry is limited to 510 bytes of key.  A longer key keeps its first
+508 bytes and ends with a 2 byte digest of the bytes the truncation discards,
+which makes two long keys with the same start compare unequal.  The digest is
+a CRC-16/ARC, polynomial 0x8005, with the register held in on-disk byte order,
+and every discarded byte except the last one feeds it.
+
+A text column is indexed up to 255 characters, memo columns included, and
+trailing spaces are dropped before the value is encoded.
+
 Access stores an 'alphabetic sort order' version of the text key columns in the
 index.  Here is the encoding as we know it:
 
@@ -811,6 +941,51 @@ bytes.  A text column will end with a NULL (0x00 or 0xff if negated).
 Note, this encoding is the "General" sort order in Access 2000-2007 (1033,
 version 0).  As of Access 2010, this is now called the "General legacy" sort
 order, and the 2010 "General" sort order is a new encoding (1033, vesion 1).
+
+A collation is named by the whole 32 bit sort id rather than by the LCID, and
+ms access resolves the language chosen in the options into one of those ids
+before writing it.  The list it offers is a list of collations, not of
+languages: Russian cannot be chosen at all, German only as German Phone Book,
+Danish only as Norwegian/Danish.  58 LCIDs resolve to 1033 and need no
+tailoring, so a weight table is the whole of their collation.
+
+A locale which does not resolve to 1033 has a tailoring: a few characters
+which take a different weight from the one the table of its family gives
+them.  Every case of a character moves together, so a tailoring which moves
+`z` moves `Z` with it.  Turkish is the exception measured so far, giving
+capital I the weights of the dotless `ı` and the dotted capital `İ` the
+weights of `i`.
+
+Some collations also weigh a sequence of characters as a unit, such as the
+czech `ch`, which takes one weight of its own between h and i.  Three things
+about a sequence have been measured:
+
+- it counts as one character in everything which follows it, so the diacritic
+  list, the unprintable offsets and the crazy flags all see one unit fewer
+  than the value has characters
+- it is weighed as a unit only when it is written all in lower case, all in
+  upper case, or in title case.  `cha`, `Cha` and `CHa` contract, `cHa` does
+  not, and a sequence barred by its case falls back to the longest sequence
+  left, so the hungarian `DZsa` is the sequence `DZ` and then an `s`
+- a character which writes no inline bytes, such as an apostrophe or a hyphen,
+  stops a sequence, so `c'ha` is a `c` and an `h`
+
+The hungarian doubled digraphs behave differently again.  `ccs` is the
+repeated first letter and then the digraph `cs`, it writes the weight of `cs`
+twice, and it reads the case rule over the digraph alone, so `cCSa` is weighed
+as a unit where `cHa` is not.
+
+Croatian differs between the two weight table families over which form is the
+unit.  In the general legacy family the two characters `dž` take the weight of
+the single character `ǆ` U+01C6, and in the general family the two characters
+take a weight of their own and U+01C6 decomposes into `d` and `ž`.
+
+French is unusual in changing no weight.  It orders the diacritics
+of a value from the end rather than the start, which sorts `cote` before `côte`
+before `coté` before `côté`.  Build the list with one entry per character which
+wrote index bytes, reverse it, then cut the trailing placeholders.  An
+apostrophe or a hyphen takes no place in the list, and the record it writes
+elsewhere in the key keeps the position it has in the general legacy order.
 
 The leaf page entries store the key column and the 3 byte page and 1 byte row
 number.
@@ -837,6 +1012,109 @@ index proper.  In src/libmdb/index.c, the last leaf read is stored, once the
 index search has been exhausted by the normal search routine, it enters a
 "clean up mode" and reads the next leaf page pointer until it's null.
  
+The Catalog
+-----------
+
+`MSysObjects` names every object in the database.  `Id` is the page number of
+the object's TDEF page for a table, `ParentId` groups the rows under the
+system objects `Tables`, `Databases` and `Relationships`, and `Name` is unique
+within a parent.
+
+The `Type` column says what the object is:
+
+```
+1 table
+4 linked ODBC table
+5 query
+6 linked table
+```
+
+A linked table has no TDEF page of its own.  `Database` and `ForeignName` name
+the file and the table it stands for, and a linked ODBC table carries a
+`Connect` string instead.
+
+The `Flags` column marks a system object with either 0x80000000 or 0x00000002,
+and a hidden object with 0x08.
+
+Complex Columns
+---------------
+
+A complex column (multivalued field, attachment, version history) is stored as
+a LONG autonumber whose value is the key of the rows which hold the real data.
+The column type is 0x12 and its 4 byte misc field holds a complex id.  The
+field exists only in the Access 2007 format and later, so a Jet 3 or Jet 4
+file has none.
+
+`MSysComplexColumns` maps that complex id to the supporting tables:
+`ConceptualTableID` is the TDEF page of the table which declares the column,
+`ColumnName` its name, `FlatTableID` the table which holds the values, and
+`ComplexTypeObjectID` a type table.
+
+The name of the type table says which kind of complex column it is, and Access
+reserves each name:
+
+```
+MSysComplexType_Attachment    attachment
+MSysComplexType_<other>       multivalued field
+MSysComplexTypeVH_<guid>      version history
+```
+
+The type tables of the first two kinds are shared, one per database, and
+Access creates them whether or not a column uses them.  A version history type
+table is created per column, which is why its name carries a guid.  It holds a
+memo column named after the memo column whose versions it keeps, and a date
+column, in either order.
+
+**A version history column and its date column have fixed names.**  The column
+in the table which declares it is always
+
+```
+VersionHistory_F5F8918F-0A3F-4DA9-AE71-184EE5012880
+```
+
+and the date column of its type table is always
+
+```
+Modified_F9B5E312-4155-4c59-9AAE-391C1B295827
+```
+
+Both hold across every database seen.  Only the type table's own guid varies
+per column.  A fixed column name means a table can keep the version history of
+at most one memo column.
+
+The flat table is named `f_<32 hex digits>_<column>`, cut to the 64 characters a
+table name may be, which the long name of a version history column needs.  Its
+indexes are `MSysComplexPKIndex` on the primary key, `_<column>` on the foreign
+key, and for a multivalued field or an attachment `IdxFKPrimaryScalar` on the
+foreign key plus a value column, `Value` for a multivalued field and `FileName`
+for an attachment.  Access also writes a unique `<column>_<32 hex digits>` index
+on the complex column itself, cut to 64 characters the same way.  Only the
+foreign key index is needed to read the values, and Access opens a file which
+has neither of the other two.
+
+Each row of the flat table carries the complex id of the row it belongs to in
+a foreign key column marked by ext flag 0x08.  The flat table also holds a LONG
+autonumber primary key, which is the id of one value, and the columns of the
+type table by the same names.
+
+The complex id is a per row autonumber of the table which declares the column,
+and every complex column of one row shares it.  A row written before a complex
+column was added holds none, and Access shows and edits such a row but fails to
+save the edit.
+
+`MSysObjects.Flags` says which part an object plays: 0x00040000 on the table
+which declares the column, without which Access never looks for the values, and
+0x000A0000 on the flat table, without which it will not open that table at all.
+A type table is 0x00030000.  Access also sets 0x80000000 on both supporting
+kinds, which only hides them from the navigation pane.
+
+Access reads the row source of a multivalued field from the `RowSourceType` and
+`RowSource` properties of the flat table's value column, not of the column
+itself, and offers no way to add a value unless the row source names at least
+one.  An attachment column carries no properties.  A version history column
+carries none either, and instead the memo column it shadows carries
+`AppendOnly`, as does the table.
+
 Properties
 ----------
 
@@ -848,10 +1126,10 @@ They start with a 32 bits header: 'KKD\0' in Jet3 and 'MR2\0' in Jet 4.
 Next come chunks. Each chunk starts with:
 
 - 32 bits length value (this includes the length)
-- 16 bits chunk type (0x0080 contains the names, 0x0000 and 0x0001 contain
-	the values.  0x0000 seems to contain information about the "main" object,
-	e.g. the table, and 0x0001 seems to contain information about other
-	objects, e.g. the table columns)
+- 16 bits chunk type.  0x0080 contains the names shared by all the other
+	chunks.  The rest hold values, and the type says which kind of object
+	the values belong to: 0x0000 the object itself, e.g. the table, 0x0001 a
+	named column of it, and 0x0002 a named index of it
 
 ```
 Name chunk blocks (0x0080) simply contain occurences of:
@@ -861,21 +1139,99 @@ For instance:
 0x0d 0x00 and 'AccessVersion' (AccessVersion is 13 bytes, 0x0d 0x00 intel order)
 ```
 
-Value chunk blocks (0x0000 and 0x0001) contain a header:
+Value chunk blocks (0x0000, 0x0001 and 0x0002) contain a header:
 - 32 bits length value (this includes the length)
 - 16 bits name length
 - name  (0x0000 chunk blocks are not usually named, 0x0001 chunk blocks have the
-      column name to which the properties belong)
+      column name and 0x0002 chunk blocks the index name to which the
+      properties belong)
 
 Next comes one of more chunks of data:
 - 16 bit length value    (this includes the length)
-- 8 bit ddl flag
+- 8 bit flags (see below)
 - 8 bit type
 - 16 bit name (index in the name array of above chunk 0x0080)
 - 16 bit value length field (non-inclusive)
   value (07.53 for the AccessVersion example above)
 
+The flag byte is a bit field, not a boolean.  Two of the bits are known:
+
+- 0x01 is the DDL argument of the DAO CreateProperty method.  A user cannot
+	change or delete a DDL property without dbSecWriteDef permission.
+- 0x80 tells ms access to store the value without running the handler which
+	the property name is bound to, so that writing the property records a
+	state instead of bringing it about.  Ms access sets this on its own
+	account, for instance when a replication conversion stamps `Replicable`
+	on each table after the conversion has already happened, and no DAO call
+	produces it.
+
+The whole byte has to be written back unchanged.
+
 See ``props.c``` for an example.
+
+Name Maps
+---------
+
+A name map is the data behind the Name AutoCorrect option.  It records the
+tables and columns an object depends on, and ties each one to the guid in the
+`GUID` property of that table or column.  When a table or column is renamed,
+Access uses the guid to find the old name and changes the places which use it.
+
+Only Jet 4 and later files have name maps.  They are stored as OLE properties
+in the default property block of the MSysObjects row of the object:
+
+- a table has a `NameMap` property.  It has a table record for the table
+  itself, a column record for each column and a reference record for each
+  name that an expression in the table (a calculated column, a validation
+  rule) uses
+- a query has a `DOL` property in the same format.  It has a table record for
+  each table or query the query reads and a column record for each column it
+  uses.  A query which tracks no names (union, pass-through, data definition)
+  has the magic value alone
+- a linked table also has one, which Jackcess ignores
+
+The database properties `Track Name AutoCorrect Info` and `Perform Name
+AutoCorrect` (LONG) turn the option on and off.  If a property is missing,
+Access takes the option as on.
+
+```
+NameMap := u32 magic 0x550ECC0A [u32 reserved, record*]
+record  := guid[16], u32 type, payload[16], name, u32 zero
+```
+
+The name is little-endian UCS-2 with a null terminator, whatever the charset
+of the database.  The trailing zero is left off the last record.  There is no
+record count, so a reader stops at the end of the data.
+
+```
+type  record     payload
+0     table      8 byte date, then 8 bytes of writer state
+6     reference  guid of the table
+7     column     guid of the table
+12    end        tag of the Access build which wrote the map, older builds
+                 did not write this record
+```
+
+The guid of a reference or an end record is zero.
+
+The date in a table record is the DateUpdate of the table in MSysObjects at
+the time Access wrote the name map.  Access rewrites the name map of a table
+when a design save changes a column or an index.  A table property change, a
+rename in the Navigation Pane, data entry and a compact do not rewrite it.
+When a column is renamed, Access changes the name in its record and keeps its
+guid.  A table renamed in the Navigation Pane keeps its old name in its table
+record until the next design save.
+
+Access repairs a query when it next opens it, not when the table changes.  It
+finds each record of the `DOL` by guid, and if the object now has a different
+name, it changes the sql and the `DOL`.  A table record for a query which the
+query reads carries the guid of that source query.  The column records under
+it carry the guids of the table columns the source query reads.  So a query
+name map must not be changed without its sql, because Access could then not
+find the old names to repair.
+
+Name maps often disagree with their tables, even in files which only Access
+wrote.  It is more reliable to find a column record by name than by guid.
 
 
 Text Data Type
